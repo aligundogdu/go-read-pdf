@@ -20,7 +20,6 @@ import (
 
 var (
 	workerSem  chan struct{}
-	queueLimit int64 = 20
 	queueCount int64
 	cache      *Cache
 )
@@ -149,13 +148,11 @@ type ExtractResponse struct {
 func main() {
 	port := flag.Int("port", 8090, "port to listen on")
 	workers := flag.Int("workers", 2, "max concurrent extract jobs")
-	maxQueue := flag.Int64("queue", 20, "max waiting jobs in queue")
 	cacheTTL := flag.Int("cache-ttl", 60, "cache TTL in minutes")
 	cacheMax := flag.Int("cache-max", 200, "max cached results")
 	flag.Parse()
 
 	workerSem = make(chan struct{}, *workers)
-	queueLimit = *maxQueue
 	cache = NewCache(time.Duration(*cacheTTL)*time.Minute, *cacheMax)
 
 	mux := http.NewServeMux()
@@ -163,8 +160,8 @@ func main() {
 	mux.HandleFunc("/health", handleHealth)
 
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("pdf-read-service starting on %s (workers: %d, queue: %d, cache: %dm/%d items)",
-		addr, *workers, *maxQueue, *cacheTTL, *cacheMax)
+	log.Printf("pdf-read-service starting on %s (workers: %d, cache: %dm/%d items)",
+		addr, *workers, *cacheTTL, *cacheMax)
 	log.Fatal(http.ListenAndServe(addr, corsMiddleware(mux)))
 }
 
@@ -193,7 +190,6 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		"active_jobs":   active,
 		"waiting_jobs":  waiting,
 		"worker_limit":  cap(workerSem),
-		"queue_limit":   queueLimit,
 		"cache_entries": cache.Len(),
 	})
 }
@@ -204,19 +200,12 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Kuyruk kontrolu
+	// Kuyruk takibi
 	current := atomic.AddInt64(&queueCount, 1)
 	defer atomic.AddInt64(&queueCount, -1)
-	if current > queueLimit {
-		writeJSON(w, http.StatusTooManyRequests, ExtractResponse{
-			Success: false,
-			Error:   fmt.Sprintf("queue full, %d jobs waiting (limit: %d)", current-1, queueLimit),
-		})
-		return
-	}
+	log.Printf("[queue] job queued (queue: %d)", current)
 
-	// Worker slot bekle
-	log.Printf("[queue] job waiting (queue: %d)", current)
+	// Worker slot bekle — tum istekler sirada bekler, 429 yok
 	workerSem <- struct{}{}
 	defer func() { <-workerSem }()
 	log.Printf("[queue] job started (queue: %d)", atomic.LoadInt64(&queueCount))
