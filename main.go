@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -20,34 +22,149 @@ var (
 	workerSem  chan struct{}
 	queueLimit int64 = 20
 	queueCount int64
+	cache      *Cache
 )
 
-type ExtractRequest struct {
-	Lang string `json:"lang"`
+// --- Cache ---
+
+type CacheEntry struct {
+	Text      string
+	CreatedAt time.Time
 }
+
+type Cache struct {
+	mu       sync.RWMutex
+	items    map[string]*CacheEntry
+	ttl      time.Duration
+	maxItems int
+}
+
+func NewCache(ttl time.Duration, maxItems int) *Cache {
+	c := &Cache{
+		items:    make(map[string]*CacheEntry),
+		ttl:      ttl,
+		maxItems: maxItems,
+	}
+	go c.cleanup()
+	return c
+}
+
+func (c *Cache) Get(key string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry, ok := c.items[key]
+	if !ok {
+		return "", false
+	}
+	if time.Since(entry.CreatedAt) > c.ttl {
+		return "", false
+	}
+	return entry.Text, true
+}
+
+func (c *Cache) Set(key string, text string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Rotasyon: limit asildiysa en eski yarisi silinir
+	if len(c.items) >= c.maxItems {
+		c.evictOldest(c.maxItems / 2)
+	}
+
+	c.items[key] = &CacheEntry{Text: text, CreatedAt: time.Now()}
+}
+
+func (c *Cache) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.items)
+}
+
+func (c *Cache) evictOldest(count int) {
+	// En eski count kadar entry sil
+	type kv struct {
+		key string
+		ts  time.Time
+	}
+	list := make([]kv, 0, len(c.items))
+	for k, v := range c.items {
+		list = append(list, kv{k, v.CreatedAt})
+	}
+	// Basit selection: en eski count tanesini bul ve sil
+	for i := 0; i < count && i < len(list); i++ {
+		oldest := i
+		for j := i + 1; j < len(list); j++ {
+			if list[j].ts.Before(list[oldest].ts) {
+				oldest = j
+			}
+		}
+		list[i], list[oldest] = list[oldest], list[i]
+		delete(c.items, list[i].key)
+	}
+}
+
+func (c *Cache) cleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	for range ticker.C {
+		c.mu.Lock()
+		now := time.Now()
+		expired := 0
+		for k, v := range c.items {
+			if now.Sub(v.CreatedAt) > c.ttl {
+				delete(c.items, k)
+				expired++
+			}
+		}
+		c.mu.Unlock()
+		if expired > 0 {
+			log.Printf("[cache] expired %d entries, %d remaining", expired, c.Len())
+		}
+	}
+}
+
+func cacheKey(prefix, lang, mode string) string {
+	return fmt.Sprintf("%s|%s|%s", prefix, lang, mode)
+}
+
+func fileHash(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	io.Copy(h, f)
+	return fmt.Sprintf("sha256:%x", h.Sum(nil))
+}
+
+// --- HTTP ---
 
 type ExtractResponse struct {
 	Success bool   `json:"success"`
 	Text    string `json:"text,omitempty"`
 	Error   string `json:"error,omitempty"`
-	Pages   int    `json:"pages,omitempty"`
+	Cached  bool   `json:"cached"`
 }
 
 func main() {
 	port := flag.Int("port", 8090, "port to listen on")
 	workers := flag.Int("workers", 2, "max concurrent extract jobs")
 	maxQueue := flag.Int64("queue", 20, "max waiting jobs in queue")
+	cacheTTL := flag.Int("cache-ttl", 60, "cache TTL in minutes")
+	cacheMax := flag.Int("cache-max", 200, "max cached results")
 	flag.Parse()
 
 	workerSem = make(chan struct{}, *workers)
 	queueLimit = *maxQueue
+	cache = NewCache(time.Duration(*cacheTTL)*time.Minute, *cacheMax)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/extract", handleExtract)
 	mux.HandleFunc("/health", handleHealth)
 
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("pdf-read-service starting on %s (workers: %d, queue: %d)", addr, *workers, *maxQueue)
+	log.Printf("pdf-read-service starting on %s (workers: %d, queue: %d, cache: %dm/%d items)",
+		addr, *workers, *maxQueue, *cacheTTL, *cacheMax)
 	log.Fatal(http.ListenAndServe(addr, corsMiddleware(mux)))
 }
 
@@ -77,6 +194,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		"waiting_jobs":  waiting,
 		"worker_limit":  cap(workerSem),
 		"queue_limit":   queueLimit,
+		"cache_entries": cache.Len(),
 	})
 }
 
@@ -86,7 +204,7 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Kuyruk kontrolu: cok fazla bekleyen varsa reddet
+	// Kuyruk kontrolu
 	current := atomic.AddInt64(&queueCount, 1)
 	defer atomic.AddInt64(&queueCount, -1)
 	if current > queueLimit {
@@ -104,15 +222,15 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[queue] job started (queue: %d)", atomic.LoadInt64(&queueCount))
 
 	lang := ""
-	mode := "" // text, ocr, auto
+	mode := ""
 	var tmpDir string
 	var tmpFile string
 	var filename string
+	var cacheID string // URL veya dosya hash
 
 	contentType := r.Header.Get("Content-Type")
 
 	if strings.HasPrefix(contentType, "application/json") {
-		// JSON body with URL
 		var req struct {
 			URL  string `json:"url"`
 			Lang string `json:"lang"`
@@ -128,6 +246,20 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 		}
 		lang = req.Lang
 		mode = req.Mode
+		if lang == "" {
+			lang = "eng"
+		}
+		if mode == "" {
+			mode = "ocr"
+		}
+
+		// URL cache kontrolu
+		cacheID = cacheKey(req.URL, lang, mode)
+		if text, ok := cache.Get(cacheID); ok {
+			log.Printf("[cache] hit: %s", req.URL)
+			writeJSON(w, http.StatusOK, ExtractResponse{Success: true, Text: text, Cached: true})
+			return
+		}
 
 		var err error
 		tmpDir, err = os.MkdirTemp("", "pdfread-")
@@ -144,7 +276,6 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 		}
 		tmpFile = filepath.Join(tmpDir, filename)
 	} else {
-		// Multipart file upload
 		if err := r.ParseMultipartForm(50 << 20); err != nil {
 			writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "invalid multipart form: " + err.Error()})
 			return
@@ -180,18 +311,30 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out.Close()
+
+		if lang == "" {
+			lang = "eng"
+		}
+		if mode == "" {
+			mode = "ocr"
+		}
+
+		// Dosya hash ile cache kontrolu
+		hash := fileHash(tmpFile)
+		if hash != "" {
+			cacheID = cacheKey(hash, lang, mode)
+			if text, ok := cache.Get(cacheID); ok {
+				os.RemoveAll(tmpDir)
+				log.Printf("[cache] hit: %s (%s)", header.Filename, hash[:20])
+				writeJSON(w, http.StatusOK, ExtractResponse{Success: true, Text: text, Cached: true})
+				return
+			}
+		}
 	}
 
 	defer os.RemoveAll(tmpDir)
 
-	if lang == "" {
-		lang = "eng"
-	}
-	if mode == "" {
-		mode = "ocr"
-	}
-
-	// Detect file type and extract
+	// Extract
 	ext := strings.ToLower(filepath.Ext(filename))
 	var text string
 	var err error
@@ -211,7 +354,15 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, ExtractResponse{Success: true, Text: strings.TrimSpace(text)})
+	result := strings.TrimSpace(text)
+
+	// Sonucu cache'e yaz
+	if cacheID != "" && result != "" {
+		cache.Set(cacheID, result)
+		log.Printf("[cache] stored: %s (%d bytes)", cacheID[:min(50, len(cacheID))], len(result))
+	}
+
+	writeJSON(w, http.StatusOK, ExtractResponse{Success: true, Text: result})
 }
 
 func downloadFile(fileURL string, dir string) (string, error) {
@@ -232,10 +383,8 @@ func downloadFile(fileURL string, dir string) (string, error) {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	// Dosya adini URL'den al
 	filename := filepath.Base(resp.Request.URL.Path)
 	if filename == "" || filename == "." || filename == "/" {
-		// Content-Type'dan uzanti tahmin et
 		ct := resp.Header.Get("Content-Type")
 		switch {
 		case strings.Contains(ct, "pdf"):
@@ -267,22 +416,15 @@ func downloadFile(fileURL string, dir string) (string, error) {
 }
 
 func extractPDF(path string, lang string, mode string) (string, error) {
-	// mode=text: sadece pdftotext (hizli, metin tabanli PDF'ler icin)
-	// mode=ocr:  her sayfayi gorsele cevirip OCR (varsayilan, karisik icerik icin)
-	// mode=auto: once pdftotext dene, sonuc kisaysa OCR'a dus
-
 	if mode == "text" {
 		return extractPDFText(path)
 	}
-
 	if mode == "auto" {
 		text, err := extractPDFText(path)
 		if err == nil && len(text) > 100 {
 			return text, nil
 		}
 	}
-
-	// OCR: sayfalari gorsele cevirip tesseract ile oku
 	return extractPDFOCR(path, lang)
 }
 
