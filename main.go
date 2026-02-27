@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,7 +12,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
+)
+
+var (
+	workerSem  chan struct{}
+	queueLimit int64 = 20
+	queueCount int64
 )
 
 type ExtractRequest struct {
@@ -27,14 +35,19 @@ type ExtractResponse struct {
 
 func main() {
 	port := flag.Int("port", 8090, "port to listen on")
+	workers := flag.Int("workers", 2, "max concurrent extract jobs")
+	maxQueue := flag.Int64("queue", 20, "max waiting jobs in queue")
 	flag.Parse()
+
+	workerSem = make(chan struct{}, *workers)
+	queueLimit = *maxQueue
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/extract", handleExtract)
 	mux.HandleFunc("/health", handleHealth)
 
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("pdf-read-service starting on %s", addr)
+	log.Printf("pdf-read-service starting on %s (workers: %d, queue: %d)", addr, *workers, *maxQueue)
 	log.Fatal(http.ListenAndServe(addr, corsMiddleware(mux)))
 }
 
@@ -52,7 +65,19 @@ func corsMiddleware(next http.Handler) http.Handler {
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, ExtractResponse{Success: true, Text: "ok"})
+	active := len(workerSem)
+	waiting := atomic.LoadInt64(&queueCount) - int64(active)
+	if waiting < 0 {
+		waiting = 0
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":       true,
+		"active_jobs":   active,
+		"waiting_jobs":  waiting,
+		"worker_limit":  cap(workerSem),
+		"queue_limit":   queueLimit,
+	})
 }
 
 func handleExtract(w http.ResponseWriter, r *http.Request) {
@@ -60,6 +85,23 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, ExtractResponse{Success: false, Error: "POST required"})
 		return
 	}
+
+	// Kuyruk kontrolu: cok fazla bekleyen varsa reddet
+	current := atomic.AddInt64(&queueCount, 1)
+	defer atomic.AddInt64(&queueCount, -1)
+	if current > queueLimit {
+		writeJSON(w, http.StatusTooManyRequests, ExtractResponse{
+			Success: false,
+			Error:   fmt.Sprintf("queue full, %d jobs waiting (limit: %d)", current-1, queueLimit),
+		})
+		return
+	}
+
+	// Worker slot bekle
+	log.Printf("[queue] job waiting (queue: %d)", current)
+	workerSem <- struct{}{}
+	defer func() { <-workerSem }()
+	log.Printf("[queue] job started (queue: %d)", atomic.LoadInt64(&queueCount))
 
 	lang := ""
 	mode := "" // text, ocr, auto
@@ -244,10 +286,20 @@ func extractPDF(path string, lang string, mode string) (string, error) {
 	return extractPDFOCR(path, lang)
 }
 
+func runCmd(timeout time.Duration, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	out, err := cmd.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("%s timeout (%s)", name, timeout)
+	}
+	return out, err
+}
+
 func extractPDFText(path string) (string, error) {
 	outFile := path + ".txt"
-	cmd := exec.Command("pdftotext", "-layout", path, outFile)
-	if err := cmd.Run(); err != nil {
+	if _, err := runCmd(60*time.Second, "pdftotext", "-layout", path, outFile); err != nil {
 		return "", fmt.Errorf("pdftotext failed: %w", err)
 	}
 	data, err := os.ReadFile(outFile)
@@ -263,8 +315,7 @@ func extractPDFText(path string) (string, error) {
 
 func extractPDFOCR(path string, lang string) (string, error) {
 	imgPrefix := filepath.Join(filepath.Dir(path), "page")
-	cmd := exec.Command("pdftoppm", "-png", "-r", "300", path, imgPrefix)
-	if err := cmd.Run(); err != nil {
+	if _, err := runCmd(60*time.Second, "pdftoppm", "-png", "-r", "300", path, imgPrefix); err != nil {
 		return "", fmt.Errorf("pdf conversion failed: %w (is poppler-utils installed?)", err)
 	}
 
@@ -290,8 +341,7 @@ func extractPDFOCR(path string, lang string) (string, error) {
 }
 
 func extractImage(path string, lang string) (string, error) {
-	cmd := exec.Command("tesseract", path, "stdout", "-l", lang)
-	out, err := cmd.Output()
+	out, err := runCmd(60*time.Second, "tesseract", path, "stdout", "-l", lang)
 	if err != nil {
 		return "", fmt.Errorf("tesseract failed: %w (is tesseract-ocr installed?)", err)
 	}
