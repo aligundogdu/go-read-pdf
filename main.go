@@ -148,7 +148,7 @@ type ExtractResponse struct {
 func main() {
 	port := flag.Int("port", 8090, "port to listen on")
 	workers := flag.Int("workers", 2, "max concurrent extract jobs")
-	cacheTTL := flag.Int("cache-ttl", 60, "cache TTL in minutes")
+	cacheTTL := flag.Int("cache-ttl", 2880, "cache TTL in minutes")
 	cacheMax := flag.Int("cache-max", 200, "max cached results")
 	flag.Parse()
 
