@@ -436,19 +436,33 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		// Object format: {"url": "...", "urls": ["..."]}
-		var req struct {
-			URL  string   `json:"url"`
-			URLs []string `json:"urls"`
-		}
-		if err := json.Unmarshal(body, &req); err != nil {
+		// Object format — url can be string or []string
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(body, &raw); err != nil {
 			writeJSON(w, http.StatusBadRequest, DownloadResponse{Success: false, Error: "invalid JSON: " + err.Error()})
 			return
 		}
-		if req.URL != "" {
-			urls = append(urls, req.URL)
+
+		// Parse "url" field (string or []string)
+		if urlRaw, ok := raw["url"]; ok {
+			var single string
+			if err := json.Unmarshal(urlRaw, &single); err == nil {
+				urls = append(urls, single)
+			} else {
+				var multi []string
+				if err := json.Unmarshal(urlRaw, &multi); err == nil {
+					urls = append(urls, multi...)
+				}
+			}
 		}
-		urls = append(urls, req.URLs...)
+
+		// Parse "urls" field ([]string)
+		if urlsRaw, ok := raw["urls"]; ok {
+			var multi []string
+			if err := json.Unmarshal(urlsRaw, &multi); err == nil {
+				urls = append(urls, multi...)
+			}
+		}
 	}
 
 	if len(urls) == 0 {
