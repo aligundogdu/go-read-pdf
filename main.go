@@ -767,16 +767,37 @@ func extractPDFOCR(path string, lang string) (string, error) {
 	}
 
 	var parts []string
+	cached, ocrd := 0, 0
 	for _, img := range matches {
+		// Sayfa image hash'i ile page-level cache kontrolu
+		pageHash := fileHash(img)
+		if pageHash != "" {
+			if text, ok := fileCache.GetText(pageHash, lang, "page"); ok {
+				parts = append(parts, text)
+				cached++
+				continue
+			}
+		}
+
 		text, err := extractImage(img, lang)
 		if err != nil {
 			continue
 		}
 		parts = append(parts, text)
+		ocrd++
+
+		// Sayfa sonucunu cache'le
+		if pageHash != "" {
+			fileCache.SetText(pageHash, lang, "page", text)
+		}
 	}
 
 	if len(parts) == 0 {
 		return "", fmt.Errorf("no text extracted from PDF")
+	}
+
+	if cached > 0 {
+		log.Printf("[page-cache] %d pages from cache, %d pages OCR'd", cached, ocrd)
 	}
 
 	return strings.Join(parts, "\n\n--- page break ---\n\n"), nil
