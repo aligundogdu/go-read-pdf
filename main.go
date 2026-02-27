@@ -427,21 +427,33 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Paralel indirme — max 5 eşzamanlı
 	results := make([]DownloadFileResult, len(urls))
+	var wg sync.WaitGroup
+	dlSem := make(chan struct{}, 5)
+
 	for i, u := range urls {
-		entry, cached, err := fileCache.Store(u)
-		if err != nil {
-			log.Printf("[download] failed: %s — %v", u, err)
-			results[i] = DownloadFileResult{URL: u, Error: err.Error()}
-		} else {
-			if cached {
-				log.Printf("[download] already cached: %s", u)
+		wg.Add(1)
+		go func(idx int, url string) {
+			defer wg.Done()
+			dlSem <- struct{}{}
+			defer func() { <-dlSem }()
+
+			entry, cached, err := fileCache.Store(url)
+			if err != nil {
+				log.Printf("[download] failed: %s — %v", url, err)
+				results[idx] = DownloadFileResult{URL: url, Error: err.Error()}
 			} else {
-				log.Printf("[download] cached: %s (%d bytes)", u, entry.Size)
+				if cached {
+					log.Printf("[download] already cached: %s", url)
+				} else {
+					log.Printf("[download] cached: %s (%d bytes)", url, entry.Size)
+				}
+				results[idx] = DownloadFileResult{URL: url, Cached: cached, Size: entry.Size}
 			}
-			results[i] = DownloadFileResult{URL: u, Cached: cached, Size: entry.Size}
-		}
+		}(i, u)
 	}
+	wg.Wait()
 
 	writeJSON(w, http.StatusOK, DownloadResponse{Success: true, Files: results})
 }
@@ -451,16 +463,6 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, ExtractResponse{Success: false, Error: "POST required"})
 		return
 	}
-
-	// Kuyruk takibi
-	current := atomic.AddInt64(&queueCount, 1)
-	defer atomic.AddInt64(&queueCount, -1)
-	log.Printf("[queue] job queued (queue: %d)", current)
-
-	// Worker slot bekle — tum istekler sirada bekler, 429 yok
-	workerSem <- struct{}{}
-	defer func() { <-workerSem }()
-	log.Printf("[queue] job started (queue: %d)", atomic.LoadInt64(&queueCount))
 
 	lang := ""
 	mode := ""
@@ -494,7 +496,7 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 			mode = "ocr"
 		}
 
-		// Text cache kontrolu (disk tabanlı)
+		// Text cache kontrolu — worker slot beklemeden hemen dön
 		if text, ok := fileCache.GetText(req.URL, lang, mode); ok {
 			log.Printf("[text-cache] hit: %s", req.URL)
 			writeJSON(w, http.StatusOK, ExtractResponse{Success: true, Text: text, Cached: true})
@@ -502,10 +504,9 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 		}
 		cacheID = req.URL
 
-		// File cache kontrolu — önceden /download ile indirilmiş olabilir
+		// Dosya indirme — worker slot beklemeden yap (I/O bound, CPU değil)
 		if entry, ok := fileCache.Get(req.URL); ok {
 			log.Printf("[file-cache] hit: %s → %s", req.URL, entry.Path)
-			// Copy cached file to a temp dir for processing (OCR creates temp files alongside)
 			var err error
 			tmpDir, err = os.MkdirTemp("", "pdfread-")
 			if err != nil {
@@ -520,7 +521,6 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
-			// File cache'te yok — indir ve cache'le
 			entry, _, err := fileCache.Store(req.URL)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "download failed: " + err.Error()})
@@ -541,6 +541,15 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+
+		// Worker slot sadece OCR/extract için bekle
+		current := atomic.AddInt64(&queueCount, 1)
+		defer atomic.AddInt64(&queueCount, -1)
+		log.Printf("[queue] job queued (queue: %d)", current)
+		workerSem <- struct{}{}
+		defer func() { <-workerSem }()
+		log.Printf("[queue] job started (queue: %d)", atomic.LoadInt64(&queueCount))
+
 	} else {
 		if err := r.ParseMultipartForm(50 << 20); err != nil {
 			writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "invalid multipart form: " + err.Error()})
@@ -596,6 +605,14 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+
+		// Worker slot sadece OCR/extract için bekle
+		current := atomic.AddInt64(&queueCount, 1)
+		defer atomic.AddInt64(&queueCount, -1)
+		log.Printf("[queue] job queued (queue: %d)", current)
+		workerSem <- struct{}{}
+		defer func() { <-workerSem }()
+		log.Printf("[queue] job started (queue: %d)", atomic.LoadInt64(&queueCount))
 	}
 
 	defer os.RemoveAll(tmpDir)
