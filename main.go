@@ -26,6 +26,7 @@ var (
 	fileCache    *FileCache
 	ocrEngine    string // "paddle" or "tesseract"
 	wrapperPath  string // path to paddleocr_wrapper.py
+	pythonPath   string // path to python3 (venv or system)
 	ocrThreads   int    // threads per PaddleOCR call
 )
 
@@ -305,12 +306,13 @@ func main() {
 	workerSem = make(chan struct{}, *workers)
 	fileCache = NewFileCache(*fileCacheDir, time.Duration(*cacheTTL)*time.Minute, *fileCacheMax)
 
-	// Resolve wrapper path (next to the binary)
+	// Resolve wrapper path and venv python
 	exe, _ := os.Executable()
-	wrapperPath = filepath.Join(filepath.Dir(exe), "paddleocr_wrapper.py")
-	// Fallback: check script dir
+	exeDir := filepath.Dir(exe)
+
+	// Wrapper script arama sırası: exe dizini → çalışma dizini
+	wrapperPath = filepath.Join(exeDir, "paddleocr_wrapper.py")
 	if _, err := os.Stat(wrapperPath); err != nil {
-		// Try current working directory
 		if wd, err := os.Getwd(); err == nil {
 			alt := filepath.Join(wd, "paddleocr_wrapper.py")
 			if _, err := os.Stat(alt); err == nil {
@@ -319,10 +321,25 @@ func main() {
 		}
 	}
 
+	// Python arama sırası: venv (exe dizini) → venv (/opt/pdf-read-service) → sistem python3
+	pythonPath = "python3"
+	venvCandidates := []string{
+		filepath.Join(exeDir, "venv", "bin", "python3"),
+		"/opt/pdf-read-service/venv/bin/python3",
+	}
+	for _, vp := range venvCandidates {
+		if _, err := os.Stat(vp); err == nil {
+			pythonPath = vp
+			break
+		}
+	}
+
 	if ocrEngine == "paddle" {
 		if _, err := os.Stat(wrapperPath); err != nil {
 			log.Printf("[WARN] paddleocr_wrapper.py not found at %s, falling back to tesseract", wrapperPath)
 			ocrEngine = "tesseract"
+		} else {
+			log.Printf("[ocr] using PaddleOCR: python=%s wrapper=%s threads=%d", pythonPath, wrapperPath, ocrThreads)
 		}
 	}
 
@@ -763,11 +780,20 @@ func runCmd(timeout time.Duration, name string, args ...string) ([]byte, error) 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if ctx.Err() == context.DeadlineExceeded {
 		return nil, fmt.Errorf("%s timeout (%s)", name, timeout)
 	}
-	return out, err
+	if err != nil {
+		errMsg := stderr.String()
+		if errMsg != "" {
+			return nil, fmt.Errorf("%s failed: %w\nstderr: %s", name, err, errMsg)
+		}
+		return nil, fmt.Errorf("%s failed: %w", name, err)
+	}
+	return out, nil
 }
 
 func extractPDFText(path string) (string, error) {
@@ -840,6 +866,7 @@ func extractPDFOCR(path string, lang string) (string, error) {
 
 			text, err := extractImage(imgPath, lang)
 			if err != nil {
+				log.Printf("[ocr] page %d failed: %v", idx+1, err)
 				return
 			}
 			results[idx] = pageResult{index: idx, text: text}
@@ -880,9 +907,9 @@ func extractImage(path string, lang string) (string, error) {
 }
 
 func extractImagePaddle(path string, lang string) (string, error) {
-	out, err := runCmd(120*time.Second, "python3", wrapperPath, path, lang, fmt.Sprintf("%d", ocrThreads))
+	out, err := runCmd(120*time.Second, pythonPath, wrapperPath, path, lang, fmt.Sprintf("%d", ocrThreads))
 	if err != nil {
-		return "", fmt.Errorf("paddleocr failed: %w (is paddleocr installed?)", err)
+		return "", fmt.Errorf("paddleocr failed: %w (is paddleocr installed in venv?)", err)
 	}
 	return string(out), nil
 }

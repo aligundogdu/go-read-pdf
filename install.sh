@@ -55,10 +55,16 @@ if [ "$IS_UPDATE" = false ]; then
         exit 1
     fi
 
-    # PaddleOCR kurulumu
-    echo "[*] PaddleOCR kuruluyor..."
-    pip3 install --upgrade pip
-    pip3 install paddlepaddle paddleocr
+    # PaddleOCR kurulumu (venv icinde)
+    echo "[*] PaddleOCR kuruluyor (venv)..."
+    VENV_DIR="${INSTALL_DIR}/venv"
+    if [ -f /etc/debian_version ]; then
+        sudo apt-get install -y python3-venv python3-full
+    fi
+    sudo mkdir -p "$INSTALL_DIR"
+    sudo python3 -m venv "$VENV_DIR"
+    sudo "$VENV_DIR/bin/pip" install --upgrade pip
+    sudo "$VENV_DIR/bin/pip" install paddlepaddle paddleocr
 fi
 
 # Go kontrolu
