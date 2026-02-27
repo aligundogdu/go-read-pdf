@@ -56,10 +56,16 @@ Dosya yükleyerek metin çıkarır. Multipart form-data olarak gönderilir.
 
 **Parametreler:**
 
-| Alan   | Tip    | Zorunlu | Açıklama                                      |
-|--------|--------|---------|-----------------------------------------------|
-| `file` | file   | Evet    | PDF veya görsel dosya                         |
-| `lang` | string | Hayır   | Tesseract dil kodu (varsayılan: `eng`)        |
+| Alan   | Tip    | Zorunlu | Açıklama                                                          |
+|--------|--------|---------|-------------------------------------------------------------------|
+| `file` | file   | Evet    | PDF veya görsel dosya (URL modunda `url` alanı kullanılır)        |
+| `lang` | string | Hayır   | Tesseract dil kodu (varsayılan: `eng`)                            |
+| `mode` | string | Hayır   | PDF okuma modu: `ocr` (varsayılan), `text`, `auto`               |
+
+**PDF Modları:**
+- `ocr` — **(varsayılan)** Her sayfayı 300 DPI görsele çevirip OCR yapar. Metin+görsel karışık PDF'lerde en güvenilir sonuç.
+- `text` — Sadece `pdftotext` kullanır. Hızlı ama sadece metin katmanını okur, görselleri atlar.
+- `auto` — Önce `pdftotext` dener, sonuç kısaysa OCR'a düşer.
 
 **Desteklenen formatlar:** `.pdf`, `.png`, `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.bmp`, `.gif`, `.webp`
 

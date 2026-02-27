@@ -61,6 +61,7 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lang := ""
+	mode := "" // text, ocr, auto
 	var tmpDir string
 	var tmpFile string
 	var filename string
@@ -72,6 +73,7 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			URL  string `json:"url"`
 			Lang string `json:"lang"`
+			Mode string `json:"mode"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "invalid JSON: " + err.Error()})
@@ -82,6 +84,7 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		lang = req.Lang
+		mode = req.Mode
 
 		var err error
 		tmpDir, err = os.MkdirTemp("", "pdfread-")
@@ -104,6 +107,7 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		lang = r.FormValue("lang")
+		mode = r.FormValue("mode")
 
 		file, header, err := r.FormFile("file")
 		if err != nil {
@@ -140,6 +144,9 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 	if lang == "" {
 		lang = "eng"
 	}
+	if mode == "" {
+		mode = "ocr"
+	}
 
 	// Detect file type and extract
 	ext := strings.ToLower(filepath.Ext(filename))
@@ -148,7 +155,7 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 
 	switch ext {
 	case ".pdf":
-		text, err = extractPDF(tmpFile, lang)
+		text, err = extractPDF(tmpFile, lang, mode)
 	case ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp":
 		text, err = extractImage(tmpFile, lang)
 	default:
@@ -209,32 +216,52 @@ func downloadFile(url string, dir string) (string, error) {
 	return filename, nil
 }
 
-func extractPDF(path string, lang string) (string, error) {
-	// First try pdftotext (fast, works for text-based PDFs)
-	outFile := path + ".txt"
-	cmd := exec.Command("pdftotext", "-layout", path, outFile)
-	if err := cmd.Run(); err == nil {
-		data, err := os.ReadFile(outFile)
-		if err == nil {
-			text := strings.TrimSpace(string(data))
-			if len(text) > 0 {
-				return text, nil
-			}
+func extractPDF(path string, lang string, mode string) (string, error) {
+	// mode=text: sadece pdftotext (hizli, metin tabanli PDF'ler icin)
+	// mode=ocr:  her sayfayi gorsele cevirip OCR (varsayilan, karisik icerik icin)
+	// mode=auto: once pdftotext dene, sonuc kisaysa OCR'a dus
+
+	if mode == "text" {
+		return extractPDFText(path)
+	}
+
+	if mode == "auto" {
+		text, err := extractPDFText(path)
+		if err == nil && len(text) > 100 {
+			return text, nil
 		}
 	}
 
-	// Fallback: scanned PDF -> convert pages to images, then OCR
-	// Convert PDF to images using pdftoppm
+	// OCR: sayfalari gorsele cevirip tesseract ile oku
+	return extractPDFOCR(path, lang)
+}
+
+func extractPDFText(path string) (string, error) {
+	outFile := path + ".txt"
+	cmd := exec.Command("pdftotext", "-layout", path, outFile)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("pdftotext failed: %w", err)
+	}
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		return "", err
+	}
+	text := strings.TrimSpace(string(data))
+	if len(text) == 0 {
+		return "", fmt.Errorf("pdftotext returned empty")
+	}
+	return text, nil
+}
+
+func extractPDFOCR(path string, lang string) (string, error) {
 	imgPrefix := filepath.Join(filepath.Dir(path), "page")
-	cmd = exec.Command("pdftoppm", "-png", "-r", "300", path, imgPrefix)
+	cmd := exec.Command("pdftoppm", "-png", "-r", "300", path, imgPrefix)
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("pdf conversion failed: %w (is poppler-utils installed?)", err)
 	}
 
-	// OCR each page image
 	matches, _ := filepath.Glob(imgPrefix + "-*.png")
 	if len(matches) == 0 {
-		// pdftoppm might produce single page without number
 		matches, _ = filepath.Glob(imgPrefix + "*.png")
 	}
 
