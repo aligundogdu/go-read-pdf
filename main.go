@@ -297,7 +297,7 @@ func main() {
 	cacheTTL := flag.Int("cache-ttl", 2880, "cache TTL in minutes")
 	fileCacheDir := flag.String("file-cache-dir", "/tmp/pdfread-cache", "directory for file cache")
 	fileCacheMax := flag.Int("file-cache-max", 100, "max cached files")
-	engine := flag.String("ocr-engine", "paddle", "OCR engine: paddle or tesseract")
+	engine := flag.String("ocr-engine", "tesseract", "OCR engine: paddle or tesseract")
 	threads := flag.Int("ocr-threads", 4, "threads per PaddleOCR call")
 	flag.Parse()
 

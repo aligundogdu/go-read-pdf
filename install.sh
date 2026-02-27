@@ -38,7 +38,7 @@ WORKERS="${2:-${DEF_WORKERS:-2}}"
 CACHE_TTL="${3:-${DEF_CACHE_TTL:-2880}}"
 FILE_CACHE_DIR="${4:-${DEF_FILE_CACHE_DIR:-/tmp/pdfread-cache}}"
 FILE_CACHE_MAX="${5:-${DEF_FILE_CACHE_MAX:-100}}"
-OCR_ENGINE="${6:-${DEF_OCR_ENGINE:-paddle}}"
+OCR_ENGINE="${6:-${DEF_OCR_ENGINE:-tesseract}}"
 OCR_THREADS="${7:-${DEF_OCR_THREADS:-4}}"
 
 if [ "$IS_UPDATE" = true ]; then
