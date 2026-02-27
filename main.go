@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -755,6 +757,11 @@ func extractPDFText(path string) (string, error) {
 	return text, nil
 }
 
+type pageResult struct {
+	index int
+	text  string
+}
+
 func extractPDFOCR(path string, lang string) (string, error) {
 	imgPrefix := filepath.Join(filepath.Dir(path), "page")
 	if _, err := runCmd(60*time.Second, "pdftoppm", "-png", "-r", "300", path, imgPrefix); err != nil {
@@ -765,30 +772,58 @@ func extractPDFOCR(path string, lang string) (string, error) {
 	if len(matches) == 0 {
 		matches, _ = filepath.Glob(imgPrefix + "*.png")
 	}
+	sort.Strings(matches) // sayfa sırasını koru
 
-	var parts []string
-	cached, ocrd := 0, 0
-	for _, img := range matches {
-		// Sayfa image hash'i ile page-level cache kontrolu
-		pageHash := fileHash(img)
-		if pageHash != "" {
-			if text, ok := fileCache.GetText(pageHash, lang, "page"); ok {
-				parts = append(parts, text)
-				cached++
-				continue
+	// Paralel OCR — CPU çekirdek sayısı kadar eşzamanlı
+	maxParallel := runtime.NumCPU()
+	if maxParallel > len(matches) {
+		maxParallel = len(matches)
+	}
+	ocrSem := make(chan struct{}, maxParallel)
+
+	results := make([]pageResult, len(matches))
+	var wg sync.WaitGroup
+	var cachedCount, ocrdCount int64
+
+	for i, img := range matches {
+		wg.Add(1)
+		go func(idx int, imgPath string) {
+			defer wg.Done()
+
+			// Sayfa image hash'i ile page-level cache kontrolu
+			pageHash := fileHash(imgPath)
+			if pageHash != "" {
+				if text, ok := fileCache.GetText(pageHash, lang, "page"); ok {
+					results[idx] = pageResult{index: idx, text: text}
+					atomic.AddInt64(&cachedCount, 1)
+					return
+				}
 			}
-		}
 
-		text, err := extractImage(img, lang)
-		if err != nil {
-			continue
-		}
-		parts = append(parts, text)
-		ocrd++
+			// Tesseract için slot al
+			ocrSem <- struct{}{}
+			defer func() { <-ocrSem }()
 
-		// Sayfa sonucunu cache'le
-		if pageHash != "" {
-			fileCache.SetText(pageHash, lang, "page", text)
+			text, err := extractImage(imgPath, lang)
+			if err != nil {
+				return
+			}
+			results[idx] = pageResult{index: idx, text: text}
+			atomic.AddInt64(&ocrdCount, 1)
+
+			// Sayfa sonucunu cache'le
+			if pageHash != "" {
+				fileCache.SetText(pageHash, lang, "page", text)
+			}
+		}(i, img)
+	}
+	wg.Wait()
+
+	// Sonuçları sıralı birleştir
+	var parts []string
+	for _, r := range results {
+		if r.text != "" {
+			parts = append(parts, r.text)
 		}
 	}
 
@@ -796,9 +831,9 @@ func extractPDFOCR(path string, lang string) (string, error) {
 		return "", fmt.Errorf("no text extracted from PDF")
 	}
 
-	if cached > 0 {
-		log.Printf("[page-cache] %d pages from cache, %d pages OCR'd", cached, ocrd)
-	}
+	cached := atomic.LoadInt64(&cachedCount)
+	ocrd := atomic.LoadInt64(&ocrdCount)
+	log.Printf("[ocr] %d pages total, %d from cache, %d OCR'd (%d parallel)", len(matches), cached, ocrd, maxParallel)
 
 	return strings.Join(parts, "\n\n--- page break ---\n\n"), nil
 }

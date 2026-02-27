@@ -3,8 +3,9 @@ set -e
 
 PORT="${1:-8090}"
 WORKERS="${2:-2}"
-CACHE_TTL="${3:-60}"
-CACHE_MAX="${4:-200}"
+CACHE_TTL="${3:-2880}"
+FILE_CACHE_DIR="${4:-/tmp/pdfread-cache}"
+FILE_CACHE_MAX="${5:-100}"
 INSTALL_DIR="/opt/pdf-read-service"
 SERVICE_NAME="pdf-read-service"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -23,7 +24,7 @@ if [ "$IS_UPDATE" = true ]; then
 else
     echo "=== pdf-read-service ilk kurulum ==="
 fi
-echo "[*] Port: $PORT, Workers: $WORKERS, Cache TTL: ${CACHE_TTL}m, Cache Max: $CACHE_MAX"
+echo "[*] Port: $PORT, Workers: $WORKERS, Cache TTL: ${CACHE_TTL}m, File Cache: ${FILE_CACHE_DIR} (max ${FILE_CACHE_MAX})"
 
 # git pull (eger git reposu icindeyse)
 if [ -d "${SCRIPT_DIR}/.git" ]; then
@@ -78,8 +79,10 @@ if command -v brew &>/dev/null && [ "$(uname)" = "Darwin" ]; then
         <string>${WORKERS}</string>
         <string>-cache-ttl</string>
         <string>${CACHE_TTL}</string>
-        <string>-cache-max</string>
-        <string>${CACHE_MAX}</string>
+        <string>-file-cache-dir</string>
+        <string>${FILE_CACHE_DIR}</string>
+        <string>-file-cache-max</string>
+        <string>${FILE_CACHE_MAX}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -126,7 +129,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_DIR}/pdf-read-service -port ${PORT} -workers ${WORKERS} -cache-ttl ${CACHE_TTL} -cache-max ${CACHE_MAX}
+ExecStart=${INSTALL_DIR}/pdf-read-service -port ${PORT} -workers ${WORKERS} -cache-ttl ${CACHE_TTL} -file-cache-dir ${FILE_CACHE_DIR} -file-cache-max ${FILE_CACHE_MAX}
 Restart=always
 RestartSec=5
 StandardOutput=journal
