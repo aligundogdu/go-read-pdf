@@ -6,6 +6,8 @@ WORKERS="${2:-2}"
 CACHE_TTL="${3:-2880}"
 FILE_CACHE_DIR="${4:-/tmp/pdfread-cache}"
 FILE_CACHE_MAX="${5:-100}"
+OCR_ENGINE="${6:-paddle}"
+OCR_THREADS="${7:-4}"
 INSTALL_DIR="/opt/pdf-read-service"
 SERVICE_NAME="pdf-read-service"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -24,7 +26,7 @@ if [ "$IS_UPDATE" = true ]; then
 else
     echo "=== pdf-read-service ilk kurulum ==="
 fi
-echo "[*] Port: $PORT, Workers: $WORKERS, Cache TTL: ${CACHE_TTL}m, File Cache: ${FILE_CACHE_DIR} (max ${FILE_CACHE_MAX})"
+echo "[*] Port: $PORT, Workers: $WORKERS, Cache TTL: ${CACHE_TTL}m, File Cache: ${FILE_CACHE_DIR} (max ${FILE_CACHE_MAX}), OCR: ${OCR_ENGINE} (threads: ${OCR_THREADS})"
 
 # git pull (eger git reposu icindeyse)
 if [ -d "${SCRIPT_DIR}/.git" ]; then
@@ -37,17 +39,26 @@ if [ "$IS_UPDATE" = false ]; then
     if [ -f /etc/debian_version ]; then
         echo "[*] Debian/Ubuntu tespit edildi, paketler kuruluyor..."
         sudo apt-get update -qq
-        sudo apt-get install -y poppler-utils tesseract-ocr tesseract-ocr-tur tesseract-ocr-eng
+        sudo apt-get install -y poppler-utils python3 python3-pip
+        # Tesseract (fallback)
+        sudo apt-get install -y tesseract-ocr tesseract-ocr-tur tesseract-ocr-eng
     elif [ -f /etc/redhat-release ]; then
         echo "[*] RHEL/CentOS tespit edildi, paketler kuruluyor..."
-        sudo yum install -y poppler-utils tesseract tesseract-langpack-tur tesseract-langpack-eng
+        sudo yum install -y poppler-utils python3 python3-pip
+        sudo yum install -y tesseract tesseract-langpack-tur tesseract-langpack-eng
     elif command -v brew &>/dev/null; then
         echo "[*] macOS tespit edildi, paketler kuruluyor..."
-        brew install poppler tesseract tesseract-lang
+        brew install poppler python3
+        brew install tesseract tesseract-lang
     else
-        echo "[!] OS tespit edilemedi. poppler-utils ve tesseract-ocr manuel kurun."
+        echo "[!] OS tespit edilemedi. poppler-utils ve python3 manuel kurun."
         exit 1
     fi
+
+    # PaddleOCR kurulumu
+    echo "[*] PaddleOCR kuruluyor..."
+    pip3 install --upgrade pip
+    pip3 install paddlepaddle paddleocr
 fi
 
 # Go kontrolu
@@ -83,6 +94,10 @@ if command -v brew &>/dev/null && [ "$(uname)" = "Darwin" ]; then
         <string>${FILE_CACHE_DIR}</string>
         <string>-file-cache-max</string>
         <string>${FILE_CACHE_MAX}</string>
+        <string>-ocr-engine</string>
+        <string>${OCR_ENGINE}</string>
+        <string>-ocr-threads</string>
+        <string>${OCR_THREADS}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -119,6 +134,7 @@ fi
 echo "[*] ${INSTALL_DIR} altina kuruluyor..."
 sudo mkdir -p "$INSTALL_DIR"
 sudo cp pdf-read-service "$INSTALL_DIR/"
+sudo cp paddleocr_wrapper.py "$INSTALL_DIR/"
 
 if [ "$IS_UPDATE" = false ]; then
     echo "[*] systemd servisi olusturuluyor..."
@@ -129,7 +145,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_DIR}/pdf-read-service -port ${PORT} -workers ${WORKERS} -cache-ttl ${CACHE_TTL} -file-cache-dir ${FILE_CACHE_DIR} -file-cache-max ${FILE_CACHE_MAX}
+ExecStart=${INSTALL_DIR}/pdf-read-service -port ${PORT} -workers ${WORKERS} -cache-ttl ${CACHE_TTL} -file-cache-dir ${FILE_CACHE_DIR} -file-cache-max ${FILE_CACHE_MAX} -ocr-engine ${OCR_ENGINE} -ocr-threads ${OCR_THREADS}
 Restart=always
 RestartSec=5
 StandardOutput=journal

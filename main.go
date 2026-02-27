@@ -21,9 +21,12 @@ import (
 )
 
 var (
-	workerSem  chan struct{}
-	queueCount int64
-	fileCache  *FileCache
+	workerSem    chan struct{}
+	queueCount   int64
+	fileCache    *FileCache
+	ocrEngine    string // "paddle" or "tesseract"
+	wrapperPath  string // path to paddleocr_wrapper.py
+	ocrThreads   int    // threads per PaddleOCR call
 )
 
 
@@ -293,10 +296,35 @@ func main() {
 	cacheTTL := flag.Int("cache-ttl", 2880, "cache TTL in minutes")
 	fileCacheDir := flag.String("file-cache-dir", "/tmp/pdfread-cache", "directory for file cache")
 	fileCacheMax := flag.Int("file-cache-max", 100, "max cached files")
+	engine := flag.String("ocr-engine", "paddle", "OCR engine: paddle or tesseract")
+	threads := flag.Int("ocr-threads", 4, "threads per PaddleOCR call")
 	flag.Parse()
 
+	ocrEngine = *engine
+	ocrThreads = *threads
 	workerSem = make(chan struct{}, *workers)
 	fileCache = NewFileCache(*fileCacheDir, time.Duration(*cacheTTL)*time.Minute, *fileCacheMax)
+
+	// Resolve wrapper path (next to the binary)
+	exe, _ := os.Executable()
+	wrapperPath = filepath.Join(filepath.Dir(exe), "paddleocr_wrapper.py")
+	// Fallback: check script dir
+	if _, err := os.Stat(wrapperPath); err != nil {
+		// Try current working directory
+		if wd, err := os.Getwd(); err == nil {
+			alt := filepath.Join(wd, "paddleocr_wrapper.py")
+			if _, err := os.Stat(alt); err == nil {
+				wrapperPath = alt
+			}
+		}
+	}
+
+	if ocrEngine == "paddle" {
+		if _, err := os.Stat(wrapperPath); err != nil {
+			log.Printf("[WARN] paddleocr_wrapper.py not found at %s, falling back to tesseract", wrapperPath)
+			ocrEngine = "tesseract"
+		}
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/extract", handleExtract)
@@ -304,8 +332,8 @@ func main() {
 	mux.HandleFunc("/health", handleHealth)
 
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("pdf-read-service starting on %s (workers: %d, ttl: %dm, file-cache: %s/%d files)",
-		addr, *workers, *cacheTTL, *fileCacheDir, *fileCacheMax)
+	log.Printf("pdf-read-service starting on %s (workers: %d, ttl: %dm, ocr: %s, threads: %d, file-cache: %s/%d files)",
+		addr, *workers, *cacheTTL, ocrEngine, ocrThreads, *fileCacheDir, *fileCacheMax)
 	log.Fatal(http.ListenAndServe(addr, corsMiddleware(mux)))
 }
 
@@ -331,6 +359,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":            true,
+		"ocr_engine":         ocrEngine,
 		"active_jobs":        active,
 		"waiting_jobs":       waiting,
 		"worker_limit":       cap(workerSem),
@@ -774,8 +803,13 @@ func extractPDFOCR(path string, lang string) (string, error) {
 	}
 	sort.Strings(matches) // sayfa sırasını koru
 
-	// Paralel OCR — CPU çekirdek sayısı kadar eşzamanlı
+	// Paralel OCR — engine'e göre eşzamanlılık ayarla
+	// PaddleOCR kendi içinde multi-thread, fazla paralel sayfa CPU'yu boğar
+	// Tesseract single-thread, çekirdek sayısı kadar paralel güvenli
 	maxParallel := runtime.NumCPU()
+	if ocrEngine == "paddle" {
+		maxParallel = max(1, runtime.NumCPU()/ocrThreads)
+	}
 	if maxParallel > len(matches) {
 		maxParallel = len(matches)
 	}
@@ -839,6 +873,21 @@ func extractPDFOCR(path string, lang string) (string, error) {
 }
 
 func extractImage(path string, lang string) (string, error) {
+	if ocrEngine == "paddle" {
+		return extractImagePaddle(path, lang)
+	}
+	return extractImageTesseract(path, lang)
+}
+
+func extractImagePaddle(path string, lang string) (string, error) {
+	out, err := runCmd(120*time.Second, "python3", wrapperPath, path, lang, fmt.Sprintf("%d", ocrThreads))
+	if err != nil {
+		return "", fmt.Errorf("paddleocr failed: %w (is paddleocr installed?)", err)
+	}
+	return string(out), nil
+}
+
+func extractImageTesseract(path string, lang string) (string, error) {
 	out, err := runCmd(60*time.Second, "tesseract", path, "stdout", "-l", lang)
 	if err != nil {
 		return "", fmt.Errorf("tesseract failed: %w (is tesseract-ocr installed?)", err)
