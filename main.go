@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -819,7 +818,7 @@ type pageResult struct {
 
 func extractPDFOCR(path string, lang string) (string, error) {
 	imgPrefix := filepath.Join(filepath.Dir(path), "page")
-	if _, err := runCmd(60*time.Second, "pdftoppm", "-png", "-r", "300", path, imgPrefix); err != nil {
+	if _, err := runCmd(120*time.Second, "pdftoppm", "-png", "-r", "200", path, imgPrefix); err != nil {
 		return "", fmt.Errorf("pdf conversion failed: %w (is poppler-utils installed?)", err)
 	}
 
@@ -829,12 +828,11 @@ func extractPDFOCR(path string, lang string) (string, error) {
 	}
 	sort.Strings(matches) // sayfa sırasını koru
 
-	// Paralel OCR — engine'e göre eşzamanlılık ayarla
-	// PaddleOCR kendi içinde multi-thread, fazla paralel sayfa CPU'yu boğar
-	// Tesseract single-thread, çekirdek sayısı kadar paralel güvenli
-	maxParallel := runtime.NumCPU()
-	if ocrEngine == "paddle" {
-		maxParallel = max(1, runtime.NumCPU()/ocrThreads)
+	// Paralel OCR — workers flag'i kadar eşzamanlı
+	// Tesseract CPU-yoğun, fazla paralel düşük çekirdekli CPU'da timeout'a yol açar
+	maxParallel := cap(workerSem)
+	if maxParallel < 1 {
+		maxParallel = 1
 	}
 	if maxParallel > len(matches) {
 		maxParallel = len(matches)
@@ -915,7 +913,7 @@ func extractImagePaddle(path string, lang string) (string, error) {
 }
 
 func extractImageTesseract(path string, lang string) (string, error) {
-	out, err := runCmd(60*time.Second, "tesseract", path, "stdout", "-l", lang)
+	out, err := runCmd(180*time.Second, "tesseract", path, "stdout", "-l", lang)
 	if err != nil {
 		return "", fmt.Errorf("tesseract failed: %w (is tesseract-ocr installed?)", err)
 	}
