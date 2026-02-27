@@ -99,6 +99,11 @@ PLIST
 fi
 
 # --- Linux (systemd) ---
+if [ "$IS_UPDATE" = true ]; then
+    echo "[*] Servis durduruluyor..."
+    sudo systemctl stop ${SERVICE_NAME}
+fi
+
 echo "[*] ${INSTALL_DIR} altina kuruluyor..."
 sudo mkdir -p "$INSTALL_DIR"
 sudo cp pdf-read-service "$INSTALL_DIR/"
