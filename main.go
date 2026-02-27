@@ -22,6 +22,7 @@ var (
 	workerSem  chan struct{}
 	queueCount int64
 	cache      *Cache
+	fileCache  *FileCache
 )
 
 // --- Cache ---
@@ -136,6 +137,186 @@ func fileHash(path string) string {
 	return fmt.Sprintf("sha256:%x", h.Sum(nil))
 }
 
+// --- File Cache (disk-based) ---
+
+type FileCacheEntry struct {
+	URL       string
+	Path      string
+	Filename  string
+	Size      int64
+	CreatedAt time.Time
+}
+
+type FileCache struct {
+	mu       sync.RWMutex
+	items    map[string]*FileCacheEntry // key: SHA256(URL)
+	dir      string
+	ttl      time.Duration
+	maxItems int
+}
+
+func NewFileCache(dir string, ttl time.Duration, maxItems int) *FileCache {
+	os.MkdirAll(dir, 0755)
+	fc := &FileCache{
+		items:    make(map[string]*FileCacheEntry),
+		dir:      dir,
+		ttl:      ttl,
+		maxItems: maxItems,
+	}
+	go fc.cleanup()
+	return fc
+}
+
+func (fc *FileCache) urlKey(url string) string {
+	h := sha256.Sum256([]byte(url))
+	return fmt.Sprintf("%x", h)
+}
+
+func (fc *FileCache) Get(url string) (*FileCacheEntry, bool) {
+	key := fc.urlKey(url)
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	entry, ok := fc.items[key]
+	if !ok {
+		return nil, false
+	}
+	if time.Since(entry.CreatedAt) > fc.ttl {
+		return nil, false
+	}
+	// Verify file still exists on disk
+	if _, err := os.Stat(entry.Path); err != nil {
+		return nil, false
+	}
+	return entry, true
+}
+
+// Store downloads and caches a URL, returning the entry. If already cached, returns existing.
+func (fc *FileCache) Store(url string) (*FileCacheEntry, bool, error) {
+	// Check if already cached
+	if entry, ok := fc.Get(url); ok {
+		return entry, true, nil
+	}
+
+	// Download to a temp dir first, then move to cache dir
+	tmpDir, err := os.MkdirTemp("", "pdfread-dl-")
+	if err != nil {
+		return nil, false, fmt.Errorf("temp dir error: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	filename, err := downloadFile(url, tmpDir)
+	if err != nil {
+		return nil, false, fmt.Errorf("download failed: %w", err)
+	}
+
+	srcPath := filepath.Join(tmpDir, filename)
+	info, err := os.Stat(srcPath)
+	if err != nil {
+		return nil, false, err
+	}
+
+	key := fc.urlKey(url)
+	ext := filepath.Ext(filename)
+	destPath := filepath.Join(fc.dir, key+ext)
+
+	// Copy file to cache dir
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return nil, false, err
+	}
+	defer src.Close()
+
+	dst, err := os.Create(destPath)
+	if err != nil {
+		return nil, false, err
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		dst.Close()
+		os.Remove(destPath)
+		return nil, false, err
+	}
+	dst.Close()
+
+	entry := &FileCacheEntry{
+		URL:       url,
+		Path:      destPath,
+		Filename:  filename,
+		Size:      info.Size(),
+		CreatedAt: time.Now(),
+	}
+
+	fc.mu.Lock()
+	// Evict if at capacity
+	if len(fc.items) >= fc.maxItems {
+		fc.evictOldest(fc.maxItems / 2)
+	}
+	fc.items[key] = entry
+	fc.mu.Unlock()
+
+	return entry, false, nil
+}
+
+func (fc *FileCache) evictOldest(count int) {
+	type kv struct {
+		key string
+		ts  time.Time
+	}
+	list := make([]kv, 0, len(fc.items))
+	for k, v := range fc.items {
+		list = append(list, kv{k, v.CreatedAt})
+	}
+	for i := 0; i < count && i < len(list); i++ {
+		oldest := i
+		for j := i + 1; j < len(list); j++ {
+			if list[j].ts.Before(list[oldest].ts) {
+				oldest = j
+			}
+		}
+		list[i], list[oldest] = list[oldest], list[i]
+		// Remove file from disk
+		if entry, ok := fc.items[list[i].key]; ok {
+			os.Remove(entry.Path)
+		}
+		delete(fc.items, list[i].key)
+	}
+}
+
+func (fc *FileCache) cleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	for range ticker.C {
+		fc.mu.Lock()
+		now := time.Now()
+		expired := 0
+		for k, v := range fc.items {
+			if now.Sub(v.CreatedAt) > fc.ttl {
+				os.Remove(v.Path)
+				delete(fc.items, k)
+				expired++
+			}
+		}
+		fc.mu.Unlock()
+		if expired > 0 {
+			log.Printf("[file-cache] expired %d entries, %d remaining", expired, fc.Len())
+		}
+	}
+}
+
+func (fc *FileCache) Len() int {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	return len(fc.items)
+}
+
+func (fc *FileCache) TotalSize() int64 {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	var total int64
+	for _, v := range fc.items {
+		total += v.Size
+	}
+	return total
+}
+
 // --- HTTP ---
 
 type ExtractResponse struct {
@@ -150,18 +331,22 @@ func main() {
 	workers := flag.Int("workers", 2, "max concurrent extract jobs")
 	cacheTTL := flag.Int("cache-ttl", 2880, "cache TTL in minutes")
 	cacheMax := flag.Int("cache-max", 200, "max cached results")
+	fileCacheDir := flag.String("file-cache-dir", "/tmp/pdfread-cache", "directory for file cache")
+	fileCacheMax := flag.Int("file-cache-max", 100, "max cached files")
 	flag.Parse()
 
 	workerSem = make(chan struct{}, *workers)
 	cache = NewCache(time.Duration(*cacheTTL)*time.Minute, *cacheMax)
+	fileCache = NewFileCache(*fileCacheDir, time.Duration(*cacheTTL)*time.Minute, *fileCacheMax)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/extract", handleExtract)
+	mux.HandleFunc("/download", handleDownload)
 	mux.HandleFunc("/health", handleHealth)
 
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("pdf-read-service starting on %s (workers: %d, cache: %dm/%d items)",
-		addr, *workers, *cacheTTL, *cacheMax)
+	log.Printf("pdf-read-service starting on %s (workers: %d, cache: %dm/%d items, file-cache: %s/%d files)",
+		addr, *workers, *cacheTTL, *cacheMax, *fileCacheDir, *fileCacheMax)
 	log.Fatal(http.ListenAndServe(addr, corsMiddleware(mux)))
 }
 
@@ -186,12 +371,108 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":       true,
-		"active_jobs":   active,
-		"waiting_jobs":  waiting,
-		"worker_limit":  cap(workerSem),
-		"cache_entries": cache.Len(),
+		"success":            true,
+		"active_jobs":        active,
+		"waiting_jobs":       waiting,
+		"worker_limit":       cap(workerSem),
+		"cache_entries":      cache.Len(),
+		"file_cache_entries": fileCache.Len(),
+		"file_cache_size":    fileCache.TotalSize(),
 	})
+}
+
+// --- Download endpoint ---
+
+type DownloadFileResult struct {
+	URL    string `json:"url"`
+	Cached bool   `json:"cached"`
+	Size   int64  `json:"size"`
+	Error  string `json:"error,omitempty"`
+}
+
+type DownloadResponse struct {
+	Success bool                 `json:"success"`
+	Files   []DownloadFileResult `json:"files"`
+	Error   string               `json:"error,omitempty"`
+}
+
+func handleDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, DownloadResponse{Success: false, Error: "POST required"})
+		return
+	}
+
+	// Parse flexible JSON body:
+	//   {"url": "..."}
+	//   {"urls": ["...", "..."]}
+	//   [{"url": "..."}, {"url": "..."}]
+	var urls []string
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, DownloadResponse{Success: false, Error: "read body error: " + err.Error()})
+		return
+	}
+
+	// Trim whitespace to detect format
+	trimmed := strings.TrimSpace(string(body))
+	if len(trimmed) == 0 {
+		writeJSON(w, http.StatusBadRequest, DownloadResponse{Success: false, Error: "empty body"})
+		return
+	}
+
+	if trimmed[0] == '[' {
+		// Array format: [{"url": "..."}, ...]
+		var arr []struct {
+			URL string `json:"url"`
+		}
+		if err := json.Unmarshal(body, &arr); err != nil {
+			writeJSON(w, http.StatusBadRequest, DownloadResponse{Success: false, Error: "invalid JSON array: " + err.Error()})
+			return
+		}
+		for _, item := range arr {
+			if item.URL != "" {
+				urls = append(urls, item.URL)
+			}
+		}
+	} else {
+		// Object format: {"url": "...", "urls": ["..."]}
+		var req struct {
+			URL  string   `json:"url"`
+			URLs []string `json:"urls"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, DownloadResponse{Success: false, Error: "invalid JSON: " + err.Error()})
+			return
+		}
+		if req.URL != "" {
+			urls = append(urls, req.URL)
+		}
+		urls = append(urls, req.URLs...)
+	}
+
+	if len(urls) == 0 {
+		writeJSON(w, http.StatusBadRequest, DownloadResponse{Success: false, Error: "no URLs provided"})
+		return
+	}
+
+	results := make([]DownloadFileResult, len(urls))
+	for i, u := range urls {
+		entry, cached, err := fileCache.Store(u)
+		if err != nil {
+			log.Printf("[download] failed: %s — %v", u, err)
+			results[i] = DownloadFileResult{URL: u, Error: err.Error()}
+		} else {
+			if cached {
+				log.Printf("[download] already cached: %s", u)
+			} else {
+				log.Printf("[download] cached: %s (%d bytes)", u, entry.Size)
+			}
+			results[i] = DownloadFileResult{URL: u, Cached: cached, Size: entry.Size}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, DownloadResponse{Success: true, Files: results})
 }
 
 func handleExtract(w http.ResponseWriter, r *http.Request) {
@@ -242,7 +523,7 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 			mode = "ocr"
 		}
 
-		// URL cache kontrolu
+		// URL cache kontrolu (text cache)
 		cacheID = cacheKey(req.URL, lang, mode)
 		if text, ok := cache.Get(cacheID); ok {
 			log.Printf("[cache] hit: %s", req.URL)
@@ -250,20 +531,45 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		var err error
-		tmpDir, err = os.MkdirTemp("", "pdfread-")
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, ExtractResponse{Success: false, Error: "temp dir error"})
-			return
-		}
+		// File cache kontrolu — önceden /download ile indirilmiş olabilir
+		if entry, ok := fileCache.Get(req.URL); ok {
+			log.Printf("[file-cache] hit: %s → %s", req.URL, entry.Path)
+			// Copy cached file to a temp dir for processing (OCR creates temp files alongside)
+			var err error
+			tmpDir, err = os.MkdirTemp("", "pdfread-")
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, ExtractResponse{Success: false, Error: "temp dir error"})
+				return
+			}
+			filename = entry.Filename
+			tmpFile = filepath.Join(tmpDir, filename)
+			if err := copyFile(entry.Path, tmpFile); err != nil {
+				os.RemoveAll(tmpDir)
+				writeJSON(w, http.StatusInternalServerError, ExtractResponse{Success: false, Error: "cache read error: " + err.Error()})
+				return
+			}
+		} else {
+			// File cache'te yok — indir ve cache'le
+			entry, _, err := fileCache.Store(req.URL)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "download failed: " + err.Error()})
+				return
+			}
+			log.Printf("[file-cache] stored: %s (%d bytes)", req.URL, entry.Size)
 
-		filename, err = downloadFile(req.URL, tmpDir)
-		if err != nil {
-			os.RemoveAll(tmpDir)
-			writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "download failed: " + err.Error()})
-			return
+			tmpDir, err = os.MkdirTemp("", "pdfread-")
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, ExtractResponse{Success: false, Error: "temp dir error"})
+				return
+			}
+			filename = entry.Filename
+			tmpFile = filepath.Join(tmpDir, filename)
+			if err := copyFile(entry.Path, tmpFile); err != nil {
+				os.RemoveAll(tmpDir)
+				writeJSON(w, http.StatusInternalServerError, ExtractResponse{Success: false, Error: "cache read error: " + err.Error()})
+				return
+			}
 		}
-		tmpFile = filepath.Join(tmpDir, filename)
 	} else {
 		if err := r.ParseMultipartForm(50 << 20); err != nil {
 			writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "invalid multipart form: " + err.Error()})
@@ -352,6 +658,23 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, ExtractResponse{Success: true, Text: result})
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 func downloadFile(fileURL string, dir string) (string, error) {
