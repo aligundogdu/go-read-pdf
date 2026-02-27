@@ -541,7 +541,7 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 			lang = "eng"
 		}
 		if mode == "" {
-			mode = "ocr"
+			mode = "auto"
 		}
 
 		// Text cache kontrolu — worker slot beklemeden hemen dön
@@ -639,7 +639,7 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 			lang = "eng"
 		}
 		if mode == "" {
-			mode = "ocr"
+			mode = "auto"
 		}
 
 		// Dosya hash ile text cache kontrolu (disk tabanlı)
