@@ -60,50 +60,91 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse multipart form (max 50MB)
-	if err := r.ParseMultipartForm(50 << 20); err != nil {
-		writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "invalid multipart form: " + err.Error()})
-		return
+	lang := ""
+	var tmpDir string
+	var tmpFile string
+	var filename string
+
+	contentType := r.Header.Get("Content-Type")
+
+	if strings.HasPrefix(contentType, "application/json") {
+		// JSON body with URL
+		var req struct {
+			URL  string `json:"url"`
+			Lang string `json:"lang"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "invalid JSON: " + err.Error()})
+			return
+		}
+		if req.URL == "" {
+			writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "url field required"})
+			return
+		}
+		lang = req.Lang
+
+		var err error
+		tmpDir, err = os.MkdirTemp("", "pdfread-")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ExtractResponse{Success: false, Error: "temp dir error"})
+			return
+		}
+
+		filename, err = downloadFile(req.URL, tmpDir)
+		if err != nil {
+			os.RemoveAll(tmpDir)
+			writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "download failed: " + err.Error()})
+			return
+		}
+		tmpFile = filepath.Join(tmpDir, filename)
+	} else {
+		// Multipart file upload
+		if err := r.ParseMultipartForm(50 << 20); err != nil {
+			writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "invalid multipart form: " + err.Error()})
+			return
+		}
+		lang = r.FormValue("lang")
+
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "file field required"})
+			return
+		}
+		defer file.Close()
+
+		tmpDir, err = os.MkdirTemp("", "pdfread-")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ExtractResponse{Success: false, Error: "temp dir error"})
+			return
+		}
+
+		filename = header.Filename
+		tmpFile = filepath.Join(tmpDir, filename)
+		out, err := os.Create(tmpFile)
+		if err != nil {
+			os.RemoveAll(tmpDir)
+			writeJSON(w, http.StatusInternalServerError, ExtractResponse{Success: false, Error: "temp file error"})
+			return
+		}
+		if _, err := io.Copy(out, file); err != nil {
+			out.Close()
+			os.RemoveAll(tmpDir)
+			writeJSON(w, http.StatusInternalServerError, ExtractResponse{Success: false, Error: "file write error"})
+			return
+		}
+		out.Close()
 	}
 
-	// Get language parameter (default: eng)
-	lang := r.FormValue("lang")
+	defer os.RemoveAll(tmpDir)
+
 	if lang == "" {
 		lang = "eng"
 	}
 
-	// Get uploaded file
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, ExtractResponse{Success: false, Error: "file field required"})
-		return
-	}
-	defer file.Close()
-
-	// Create temp file
-	tmpDir, err := os.MkdirTemp("", "pdfread-")
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, ExtractResponse{Success: false, Error: "temp dir error"})
-		return
-	}
-	defer os.RemoveAll(tmpDir)
-
-	tmpFile := filepath.Join(tmpDir, header.Filename)
-	out, err := os.Create(tmpFile)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, ExtractResponse{Success: false, Error: "temp file error"})
-		return
-	}
-	if _, err := io.Copy(out, file); err != nil {
-		out.Close()
-		writeJSON(w, http.StatusInternalServerError, ExtractResponse{Success: false, Error: "file write error"})
-		return
-	}
-	out.Close()
-
 	// Detect file type and extract
-	ext := strings.ToLower(filepath.Ext(header.Filename))
+	ext := strings.ToLower(filepath.Ext(filename))
 	var text string
+	var err error
 
 	switch ext {
 	case ".pdf":
@@ -121,6 +162,51 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, ExtractResponse{Success: true, Text: strings.TrimSpace(text)})
+}
+
+func downloadFile(url string, dir string) (string, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	// Dosya adini URL'den al
+	filename := filepath.Base(resp.Request.URL.Path)
+	if filename == "" || filename == "." || filename == "/" {
+		// Content-Type'dan uzanti tahmin et
+		ct := resp.Header.Get("Content-Type")
+		switch {
+		case strings.Contains(ct, "pdf"):
+			filename = "download.pdf"
+		case strings.Contains(ct, "png"):
+			filename = "download.png"
+		case strings.Contains(ct, "jpeg"), strings.Contains(ct, "jpg"):
+			filename = "download.jpg"
+		case strings.Contains(ct, "tiff"):
+			filename = "download.tiff"
+		case strings.Contains(ct, "webp"):
+			filename = "download.webp"
+		default:
+			filename = "download.pdf"
+		}
+	}
+
+	out, err := os.Create(filepath.Join(dir, filename))
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		return "", err
+	}
+
+	return filename, nil
 }
 
 func extractPDF(path string, lang string) (string, error) {

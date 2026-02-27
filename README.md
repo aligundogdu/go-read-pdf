@@ -81,6 +81,16 @@ curl -X POST http://localhost:8090/extract \
   -F "lang=tur+eng"
 ```
 
+#### Örnek: URL ile (dosya yüklemeden)
+
+```bash
+curl -X POST http://localhost:8090/extract \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/belge.pdf", "lang": "tur"}'
+```
+
+Servis URL'deki dosyayı indirir, uzantısını tespit eder ve metin çıkarır. Dosya adı URL'den belirlenemezse Content-Type header'ına bakılır.
+
 #### Başarılı Yanıt
 
 ```json
