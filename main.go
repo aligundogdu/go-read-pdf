@@ -21,106 +21,9 @@ import (
 var (
 	workerSem  chan struct{}
 	queueCount int64
-	cache      *Cache
 	fileCache  *FileCache
 )
 
-// --- Cache ---
-
-type CacheEntry struct {
-	Text      string
-	CreatedAt time.Time
-}
-
-type Cache struct {
-	mu       sync.RWMutex
-	items    map[string]*CacheEntry
-	ttl      time.Duration
-	maxItems int
-}
-
-func NewCache(ttl time.Duration, maxItems int) *Cache {
-	c := &Cache{
-		items:    make(map[string]*CacheEntry),
-		ttl:      ttl,
-		maxItems: maxItems,
-	}
-	go c.cleanup()
-	return c
-}
-
-func (c *Cache) Get(key string) (string, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	entry, ok := c.items[key]
-	if !ok {
-		return "", false
-	}
-	if time.Since(entry.CreatedAt) > c.ttl {
-		return "", false
-	}
-	return entry.Text, true
-}
-
-func (c *Cache) Set(key string, text string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Rotasyon: limit asildiysa en eski yarisi silinir
-	if len(c.items) >= c.maxItems {
-		c.evictOldest(c.maxItems / 2)
-	}
-
-	c.items[key] = &CacheEntry{Text: text, CreatedAt: time.Now()}
-}
-
-func (c *Cache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.items)
-}
-
-func (c *Cache) evictOldest(count int) {
-	// En eski count kadar entry sil
-	type kv struct {
-		key string
-		ts  time.Time
-	}
-	list := make([]kv, 0, len(c.items))
-	for k, v := range c.items {
-		list = append(list, kv{k, v.CreatedAt})
-	}
-	// Basit selection: en eski count tanesini bul ve sil
-	for i := 0; i < count && i < len(list); i++ {
-		oldest := i
-		for j := i + 1; j < len(list); j++ {
-			if list[j].ts.Before(list[oldest].ts) {
-				oldest = j
-			}
-		}
-		list[i], list[oldest] = list[oldest], list[i]
-		delete(c.items, list[i].key)
-	}
-}
-
-func (c *Cache) cleanup() {
-	ticker := time.NewTicker(5 * time.Minute)
-	for range ticker.C {
-		c.mu.Lock()
-		now := time.Now()
-		expired := 0
-		for k, v := range c.items {
-			if now.Sub(v.CreatedAt) > c.ttl {
-				delete(c.items, k)
-				expired++
-			}
-		}
-		c.mu.Unlock()
-		if expired > 0 {
-			log.Printf("[cache] expired %d entries, %d remaining", expired, c.Len())
-		}
-	}
-}
 
 func cacheKey(prefix, lang, mode string) string {
 	return fmt.Sprintf("%s|%s|%s", prefix, lang, mode)
@@ -273,9 +176,15 @@ func (fc *FileCache) evictOldest(count int) {
 			}
 		}
 		list[i], list[oldest] = list[oldest], list[i]
-		// Remove file from disk
+		// Remove file and associated text files from disk
 		if entry, ok := fc.items[list[i].key]; ok {
 			os.Remove(entry.Path)
+			// Remove all text cache files for this URL
+			txtPattern := filepath.Join(fc.dir, list[i].key+"_*_*.txt")
+			txtFiles, _ := filepath.Glob(txtPattern)
+			for _, tf := range txtFiles {
+				os.Remove(tf)
+			}
 		}
 		delete(fc.items, list[i].key)
 	}
@@ -290,6 +199,12 @@ func (fc *FileCache) cleanup() {
 		for k, v := range fc.items {
 			if now.Sub(v.CreatedAt) > fc.ttl {
 				os.Remove(v.Path)
+				// Remove associated text cache files
+				txtPattern := filepath.Join(fc.dir, k+"_*_*.txt")
+				txtFiles, _ := filepath.Glob(txtPattern)
+				for _, tf := range txtFiles {
+					os.Remove(tf)
+				}
 				delete(fc.items, k)
 				expired++
 			}
@@ -297,6 +212,13 @@ func (fc *FileCache) cleanup() {
 		fc.mu.Unlock()
 		if expired > 0 {
 			log.Printf("[file-cache] expired %d entries, %d remaining", expired, fc.Len())
+		}
+		// Also clean orphaned text files past TTL
+		allTxt, _ := filepath.Glob(filepath.Join(fc.dir, "*_*_*.txt"))
+		for _, tf := range allTxt {
+			if info, err := os.Stat(tf); err == nil && now.Sub(info.ModTime()) > fc.ttl {
+				os.Remove(tf)
+			}
 		}
 	}
 }
@@ -317,6 +239,43 @@ func (fc *FileCache) TotalSize() int64 {
 	return total
 }
 
+// textPath returns the disk path for a cached text result.
+func (fc *FileCache) textPath(url, lang, mode string) string {
+	key := fc.urlKey(url)
+	return filepath.Join(fc.dir, fmt.Sprintf("%s_%s_%s.txt", key, lang, mode))
+}
+
+// GetText returns cached OCR/extract text for a URL+lang+mode combo.
+func (fc *FileCache) GetText(url, lang, mode string) (string, bool) {
+	path := fc.textPath(url, lang, mode)
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	// TTL check using file mod time
+	if time.Since(info.ModTime()) > fc.ttl {
+		os.Remove(path)
+		return "", false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+// SetText stores OCR/extract text result to disk.
+func (fc *FileCache) SetText(url, lang, mode, text string) {
+	path := fc.textPath(url, lang, mode)
+	os.WriteFile(path, []byte(text), 0644)
+}
+
+// TextEntries returns the count of cached text files.
+func (fc *FileCache) TextEntries() int {
+	matches, _ := filepath.Glob(filepath.Join(fc.dir, "*_*_*.txt"))
+	return len(matches)
+}
+
 // --- HTTP ---
 
 type ExtractResponse struct {
@@ -330,13 +289,11 @@ func main() {
 	port := flag.Int("port", 8090, "port to listen on")
 	workers := flag.Int("workers", 2, "max concurrent extract jobs")
 	cacheTTL := flag.Int("cache-ttl", 2880, "cache TTL in minutes")
-	cacheMax := flag.Int("cache-max", 200, "max cached results")
 	fileCacheDir := flag.String("file-cache-dir", "/tmp/pdfread-cache", "directory for file cache")
 	fileCacheMax := flag.Int("file-cache-max", 100, "max cached files")
 	flag.Parse()
 
 	workerSem = make(chan struct{}, *workers)
-	cache = NewCache(time.Duration(*cacheTTL)*time.Minute, *cacheMax)
 	fileCache = NewFileCache(*fileCacheDir, time.Duration(*cacheTTL)*time.Minute, *fileCacheMax)
 
 	mux := http.NewServeMux()
@@ -345,8 +302,8 @@ func main() {
 	mux.HandleFunc("/health", handleHealth)
 
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("pdf-read-service starting on %s (workers: %d, cache: %dm/%d items, file-cache: %s/%d files)",
-		addr, *workers, *cacheTTL, *cacheMax, *fileCacheDir, *fileCacheMax)
+	log.Printf("pdf-read-service starting on %s (workers: %d, ttl: %dm, file-cache: %s/%d files)",
+		addr, *workers, *cacheTTL, *fileCacheDir, *fileCacheMax)
 	log.Fatal(http.ListenAndServe(addr, corsMiddleware(mux)))
 }
 
@@ -375,7 +332,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		"active_jobs":        active,
 		"waiting_jobs":       waiting,
 		"worker_limit":       cap(workerSem),
-		"cache_entries":      cache.Len(),
+		"text_cache_entries": fileCache.TextEntries(),
 		"file_cache_entries": fileCache.Len(),
 		"file_cache_size":    fileCache.TotalSize(),
 	})
@@ -510,7 +467,7 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 	var tmpDir string
 	var tmpFile string
 	var filename string
-	var cacheID string // URL veya dosya hash
+	var cacheID string // URL veya dosya hash — text cache key
 
 	contentType := r.Header.Get("Content-Type")
 
@@ -537,13 +494,13 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 			mode = "ocr"
 		}
 
-		// URL cache kontrolu (text cache)
-		cacheID = cacheKey(req.URL, lang, mode)
-		if text, ok := cache.Get(cacheID); ok {
-			log.Printf("[cache] hit: %s", req.URL)
+		// Text cache kontrolu (disk tabanlı)
+		if text, ok := fileCache.GetText(req.URL, lang, mode); ok {
+			log.Printf("[text-cache] hit: %s", req.URL)
 			writeJSON(w, http.StatusOK, ExtractResponse{Success: true, Text: text, Cached: true})
 			return
 		}
+		cacheID = req.URL
 
 		// File cache kontrolu — önceden /download ile indirilmiş olabilir
 		if entry, ok := fileCache.Get(req.URL); ok {
@@ -628,13 +585,13 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 			mode = "ocr"
 		}
 
-		// Dosya hash ile cache kontrolu
+		// Dosya hash ile text cache kontrolu (disk tabanlı)
 		hash := fileHash(tmpFile)
 		if hash != "" {
 			cacheID = cacheKey(hash, lang, mode)
-			if text, ok := cache.Get(cacheID); ok {
+			if text, ok := fileCache.GetText(hash, lang, mode); ok {
 				os.RemoveAll(tmpDir)
-				log.Printf("[cache] hit: %s (%s)", header.Filename, hash[:20])
+				log.Printf("[text-cache] hit: %s (%s)", header.Filename, hash[:20])
 				writeJSON(w, http.StatusOK, ExtractResponse{Success: true, Text: text, Cached: true})
 				return
 			}
@@ -665,10 +622,10 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 
 	result := strings.TrimSpace(text)
 
-	// Sonucu cache'e yaz
+	// Sonucu disk text cache'e yaz
 	if cacheID != "" && result != "" {
-		cache.Set(cacheID, result)
-		log.Printf("[cache] stored: %s (%d bytes)", cacheID[:min(50, len(cacheID))], len(result))
+		fileCache.SetText(cacheID, lang, mode, result)
+		log.Printf("[text-cache] stored: %s (%d bytes)", cacheID[:min(50, len(cacheID))], len(result))
 	}
 
 	writeJSON(w, http.StatusOK, ExtractResponse{Success: true, Text: result})
