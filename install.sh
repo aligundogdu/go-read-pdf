@@ -1,16 +1,10 @@
 #!/bin/bash
 set -e
 
-PORT="${1:-8090}"
-WORKERS="${2:-2}"
-CACHE_TTL="${3:-2880}"
-FILE_CACHE_DIR="${4:-/tmp/pdfread-cache}"
-FILE_CACHE_MAX="${5:-100}"
-OCR_ENGINE="${6:-paddle}"
-OCR_THREADS="${7:-4}"
 INSTALL_DIR="/opt/pdf-read-service"
 SERVICE_NAME="pdf-read-service"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 # Guncelleme mi, ilk kurulum mu?
 IS_UPDATE=false
@@ -20,6 +14,32 @@ fi
 if [ -f "$HOME/Library/LaunchAgents/com.local.pdf-read-service.plist" ] 2>/dev/null; then
     IS_UPDATE=true
 fi
+
+# Mevcut service dosyasindan parametreleri oku (guncelleme icin varsayilan)
+_existing_param() {
+    # ExecStart satirindan -flag value ciftini parse et
+    if [ -f "$SERVICE_FILE" ]; then
+        grep -oP "(?<=$1 )\S+" "$SERVICE_FILE" 2>/dev/null || echo ""
+    fi
+}
+
+if [ "$IS_UPDATE" = true ] && [ -f "$SERVICE_FILE" ]; then
+    DEF_PORT=$(_existing_param "-port")
+    DEF_WORKERS=$(_existing_param "-workers")
+    DEF_CACHE_TTL=$(_existing_param "-cache-ttl")
+    DEF_FILE_CACHE_DIR=$(_existing_param "-file-cache-dir")
+    DEF_FILE_CACHE_MAX=$(_existing_param "-file-cache-max")
+    DEF_OCR_ENGINE=$(_existing_param "-ocr-engine")
+    DEF_OCR_THREADS=$(_existing_param "-ocr-threads")
+fi
+
+PORT="${1:-${DEF_PORT:-8090}}"
+WORKERS="${2:-${DEF_WORKERS:-2}}"
+CACHE_TTL="${3:-${DEF_CACHE_TTL:-2880}}"
+FILE_CACHE_DIR="${4:-${DEF_FILE_CACHE_DIR:-/tmp/pdfread-cache}}"
+FILE_CACHE_MAX="${5:-${DEF_FILE_CACHE_MAX:-100}}"
+OCR_ENGINE="${6:-${DEF_OCR_ENGINE:-paddle}}"
+OCR_THREADS="${7:-${DEF_OCR_THREADS:-4}}"
 
 if [ "$IS_UPDATE" = true ]; then
     echo "=== pdf-read-service guncelleme ==="
@@ -142,7 +162,6 @@ sudo mkdir -p "$INSTALL_DIR"
 sudo cp pdf-read-service "$INSTALL_DIR/"
 sudo cp paddleocr_wrapper.py "$INSTALL_DIR/"
 
-if [ "$IS_UPDATE" = false ]; then
     echo "[*] systemd servisi olusturuluyor..."
     sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null <<EOF
 [Unit]
@@ -162,7 +181,6 @@ WantedBy=multi-user.target
 EOF
     sudo systemctl daemon-reload
     sudo systemctl enable ${SERVICE_NAME}
-fi
 
 sudo systemctl restart ${SERVICE_NAME}
 
